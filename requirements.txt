@@ -2,3 +2,6 @@ flask>=3.0.0
 werkzeug>=3.0.0
 androguard>=3.3.5
 gunicorn>=21.0.0
+dnspython>=2.4.0
+python-whois>=0.9.4
+requests>=2.31.0

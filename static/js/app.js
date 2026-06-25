@@ -1,5 +1,5 @@
 /* ============================================================
-   FraudDroid — Frontend Logic
+   FraudDroid v2.0 — Frontend Logic
    ============================================================ */
 
 const $ = id => document.getElementById(id);
@@ -28,7 +28,6 @@ dropZone.addEventListener("drop", e => {
 });
 $("rescanBtn").addEventListener("click", resetUI);
 
-// On page load always show upload screen, never the report
 window.addEventListener("load", () => {
   $("reportSection").classList.add("hidden");
   $("progressSection").classList.add("hidden");
@@ -44,15 +43,18 @@ const STEPS = [
   "Parsing AndroidManifest.xml...",
   "Extracting permission list...",
   "Running permission cluster analysis...",
-  "Extracting strings from .dex...",
+  "Scanning for malware behavior patterns...",
+  "Extracting strings from .dex files...",
   "Scanning for hardcoded IOCs...",
   "Running fraud signature matching...",
-  "Computing risk score...",
-  "Building report...",
+  "Resolving DNS records for C2 domains...",
+  "Querying WHOIS intelligence...",
+  "Analyzing IP infrastructure...",
+  "Computing composite risk score...",
+  "Building investigation report...",
 ];
 
-let stepTimer = null;
-let stepIdx   = 0;
+let stepTimer = null, stepIdx = 0;
 
 function startProgressAnimation() {
   stepIdx = 0;
@@ -65,7 +67,7 @@ function startProgressAnimation() {
       $("progressBar").style.width = pct + "%";
       $("progressLabel").textContent = STEPS[stepIdx];
     }
-  }, 2800);
+  }, 2500);
 }
 
 function finishProgress() {
@@ -93,12 +95,10 @@ async function startAnalysis(file) {
     finishProgress();
 
     if (res.status === 504 || (data.error && data.error.includes("timed out"))) {
-      alert("This APK is too large to analyze fully on the free server (184MB+ APKs need more RAM).\n\nTip: Run FraudDroid locally on your machine for large APKs — it handles 300MB easily.");
+      alert("This APK took too long to analyze on the server.\n\nTip: Run FraudDroid locally for large APKs.");
       resetUI(); return;
     }
     if (data.error) { alert("Analysis error: " + data.error); resetUI(); return; }
-
-    // Validate we got a real report before rendering
     if (typeof data.total_score === "undefined" || data.total_score === null) {
       alert("Server returned an incomplete report. Please try again.");
       resetUI(); return;
@@ -106,7 +106,6 @@ async function startAnalysis(file) {
 
     currentReport = data;
     setTimeout(() => renderReport(data), 400);
-
   } catch (err) {
     finishProgress();
     alert("Request failed: " + err.message);
@@ -128,7 +127,6 @@ function resetUI() {
 // ---------------------------------------------------------------------------
 
 function renderReport(r) {
-  // Safety guard — never render with missing core fields
   if (!r || typeof r.total_score !== "number" || !r.verdict || !r.manifest) {
     alert("Report data is incomplete. Please re-upload the APK.");
     resetUI(); return;
@@ -140,6 +138,7 @@ function renderReport(r) {
   renderSummary(r);
   renderPermissions(r);
   renderStrings(r);
+  renderIntelligence(r);
   renderManifest(r);
   renderAction(r);
 }
@@ -204,9 +203,11 @@ function renderSummary(r) {
 }
 
 function renderPermissions(r) {
-  const p = r.permissions || { cluster_matches: [], risky_permissions: [] };
+  const p = r.permissions || { cluster_matches: [], risky_permissions: [], malware_indicators: [] };
+
+  // Clusters
   const clusterDiv = $("clusters");
-  if (!p.cluster_matches || !p.cluster_matches.length) {
+  if (!(p.cluster_matches || []).length) {
     clusterDiv.innerHTML = `<p class="empty-note">No fraud permission clusters matched.</p>`;
   } else {
     clusterDiv.innerHTML = p.cluster_matches.map(c => `
@@ -214,7 +215,7 @@ function renderPermissions(r) {
         <div class="cluster-head">
           <span class="cluster-name">${esc(c.cluster_name)}</span>
           <span class="sev-badge ${c.severity}">${c.severity}</span>
-          <span style="font-size:11px;color:var(--txt-muted)">${(c.matched_permissions||[]).length} permissions matched</span>
+          <span style="font-size:11px;color:var(--txt-muted)">${(c.matched_permissions||[]).length} matched</span>
         </div>
         <div class="cluster-desc">${esc(c.description)}</div>
         <div class="perm-chips">
@@ -223,8 +224,27 @@ function renderPermissions(r) {
       </div>`).join("");
   }
 
+  // Malware indicators
+  const miDiv = $("malwareIndicators");
+  if (!(p.malware_indicators || []).length) {
+    miDiv.innerHTML = `<p class="empty-note">No malware behavior patterns detected.</p>`;
+  } else {
+    miDiv.innerHTML = p.malware_indicators.map(mi => `
+      <div class="cluster ${mi.severity}">
+        <div class="cluster-head">
+          <span class="cluster-name">${esc(mi.name)}</span>
+          <span class="sev-badge ${mi.severity}">${mi.severity}</span>
+        </div>
+        <div class="cluster-desc">${esc(mi.description)}</div>
+        <div class="perm-chips">
+          ${(mi.matched_patterns||[]).map(pat => `<span class="perm-chip">${esc(pat)}</span>`).join("")}
+        </div>
+      </div>`).join("");
+  }
+
+  // Permission table
   const tbody = $("permTableBody");
-  if (!p.risky_permissions || !p.risky_permissions.length) {
+  if (!(p.risky_permissions || []).length) {
     tbody.innerHTML = `<tr><td colspan="3" class="empty-note">No high-risk permissions found.</td></tr>`; return;
   }
   tbody.innerHTML = (p.risky_permissions || [])
@@ -242,36 +262,51 @@ function renderPermissions(r) {
 }
 
 function renderStrings(r) {
-  const s = r.strings || { suspicious_urls:[], hardcoded_ips:[], api_keys:[], phone_numbers:[], emails:[], urls:[] };
+  const s = r.strings || {};
 
+  // Suspicious domains + IPs
   const seenDomains = new Set();
   const dedupedSuspUrls = (s.suspicious_urls||[]).filter(u => {
     if (seenDomains.has(u.domain)) return false;
     seenDomains.add(u.domain); return true;
   });
   const dedupedIPs = [...new Set(s.hardcoded_ips||[])];
+  const dedupedIPv6 = [...new Set(s.ipv6_addresses||[])];
 
-  const sdiv = $("suspDomains");
   let sdHtml = "";
   dedupedSuspUrls.forEach(u => { sdHtml += iocItem("DOMAIN", u.domain, u.reason); });
-  dedupedIPs.slice(0, 20).forEach(ip => { sdHtml += iocItem("IP", ip, "Hardcoded IP — possible C2/tracker"); });
-  if (dedupedIPs.length > 20) sdHtml += `<div class="ioc-note" style="padding:6px 10px">...and ${dedupedIPs.length - 20} more IPs</div>`;
-  sdiv.innerHTML = sdHtml || `<p class="empty-note">No suspicious domains or IPs found.</p>`;
+  dedupedIPs.slice(0,20).forEach(ip => { sdHtml += iocItem("IPv4", ip, "Hardcoded IP — possible C2/tracker"); });
+  dedupedIPv6.slice(0,5).forEach(ip => { sdHtml += iocItem("IPv6", ip, "Hardcoded IPv6 address"); });
+  if (dedupedIPs.length > 20) sdHtml += `<div class="ioc-note" style="padding:6px 10px">...and ${dedupedIPs.length-20} more IPs</div>`;
+  $("suspDomains").innerHTML = sdHtml || `<p class="empty-note">No suspicious domains or IPs found.</p>`;
 
+  // Credentials
   const seenKeys = new Set();
   const dedupedKeys = (s.api_keys||[]).filter(k => { if (seenKeys.has(k.value)) return false; seenKeys.add(k.value); return true; });
   $("apiKeys").innerHTML = dedupedKeys.length
     ? dedupedKeys.map(k => iocItem(k.key_type.toUpperCase(), k.value, k.risk_note)).join("")
     : `<p class="empty-note">No hardcoded credentials found.</p>`;
 
+  // Crypto wallets
+  $("cryptoWallets").innerHTML = (s.crypto_wallets||[]).length
+    ? (s.crypto_wallets||[]).map(w => iocItem(w.wallet_type, w.address, "Cryptocurrency wallet — possible fraud payment collection")).join("")
+    : `<p class="empty-note">No cryptocurrency wallet addresses found.</p>`;
+
+  // Cloud storage + WebSockets
+  let cloudHtml = "";
+  (s.cloud_storage_urls||[]).slice(0,10).forEach(u => { cloudHtml += iocItem("CLOUD", u, "Cloud storage endpoint"); });
+  (s.websocket_endpoints||[]).slice(0,10).forEach(u => { cloudHtml += iocItem("WEBSOCKET", u, "WebSocket endpoint — possible real-time C2"); });
+  $("cloudAndWs").innerHTML = cloudHtml || `<p class="empty-note">No cloud storage or WebSocket endpoints found.</p>`;
+
+  // Phones & emails
   $("phones").innerHTML = (s.phone_numbers||[]).length
     ? [...new Set(s.phone_numbers)].map(p => iocItem("PHONE", p, "")).join("")
     : `<p class="empty-note">No phone numbers found.</p>`;
-
   $("emails").innerHTML = (s.emails||[]).length
     ? [...new Set(s.emails)].map(e => iocItem("EMAIL", e, "")).join("")
     : `<p class="empty-note">No email addresses found.</p>`;
 
+  // All URLs
   const seenUrls = new Set();
   const dedupedUrls = (s.urls||[]).filter(u => { if (seenUrls.has(u.url)) return false; seenUrls.add(u.url); return true; });
   $("allUrls").innerHTML = dedupedUrls.length
@@ -283,11 +318,73 @@ function renderStrings(r) {
     : `<p class="empty-note">No URLs extracted.</p>`;
 }
 
-function iocItem(tag, val, note) {
-  return `<div class="ioc-item">
-    <span class="ioc-tag">${esc(tag)}</span>
-    <div><div class="ioc-val">${esc(val)}</div>${note ? `<div class="ioc-note">${esc(note)}</div>` : ""}</div>
-  </div>`;
+function renderIntelligence(r) {
+  const intel = r.intelligence || {};
+
+  // DNS
+  const dnsDiv = $("dnsResults");
+  const dnsRecs = intel.dns_records || [];
+  if (!dnsRecs.length) {
+    dnsDiv.innerHTML = `<p class="empty-note">No suspicious domains were resolved (no C2 domains detected or network unavailable).</p>`;
+  } else {
+    dnsDiv.innerHTML = dnsRecs.map(rec => {
+      const rows = [];
+      if (rec.a_records?.length)    rows.push(`<tr><td>A Records</td><td>${esc(rec.a_records.join(", "))}</td></tr>`);
+      if (rec.aaaa_records?.length) rows.push(`<tr><td>AAAA Records</td><td>${esc(rec.aaaa_records.join(", "))}</td></tr>`);
+      if (rec.mx_records?.length)   rows.push(`<tr><td>MX Records</td><td>${esc(rec.mx_records.join(", "))}</td></tr>`);
+      if (rec.ns_records?.length)   rows.push(`<tr><td>NS Records</td><td>${esc(rec.ns_records.join(", "))}</td></tr>`);
+      if (rec.error)                rows.push(`<tr><td>Status</td><td style="color:var(--txt-muted)">${esc(rec.error)}</td></tr>`);
+      return `<div style="margin-bottom:16px">
+        <div class="intel-domain-head">${esc(rec.domain)}</div>
+        ${rows.length ? `<table class="intel-table"><tbody>${rows.join("")}</tbody></table>` : '<p class="empty-note" style="margin:4px 0">No records resolved</p>'}
+      </div>`;
+    }).join("<hr class='intel-sep'>");
+  }
+
+  // WHOIS
+  const whoisDiv = $("whoisResults");
+  const whoisRecs = intel.whois_records || [];
+  if (!whoisRecs.length) {
+    whoisDiv.innerHTML = `<p class="empty-note">No WHOIS data (no suspicious domains or network unavailable).</p>`;
+  } else {
+    whoisDiv.innerHTML = whoisRecs.map(rec => {
+      const rows = [];
+      if (rec.registrar)        rows.push(`<tr><td>Registrar</td><td>${esc(rec.registrar)}</td></tr>`);
+      if (rec.creation_date)    rows.push(`<tr><td>Created</td><td>${esc(rec.creation_date)}${rec.days_old !== null ? ` <span style="color:${rec.is_new?'var(--red)':'var(--txt-muted)'}">(${rec.days_old} days ago${rec.is_new?' ⚠ NEW':''})</span>` : ''}</td></tr>`);
+      if (rec.expiration_date)  rows.push(`<tr><td>Expires</td><td>${esc(rec.expiration_date)}</td></tr>`);
+      if (rec.updated_date)     rows.push(`<tr><td>Updated</td><td>${esc(rec.updated_date)}</td></tr>`);
+      if (rec.country)          rows.push(`<tr><td>Country</td><td>${esc(rec.country)}</td></tr>`);
+      rows.push(`<tr><td>Privacy</td><td>${rec.privacy_protected ? '<span style="color:var(--orange)">Protected</span>' : 'Public'}</td></tr>`);
+      if (rec.error)            rows.push(`<tr><td>Status</td><td style="color:var(--txt-muted)">${esc(rec.error)}</td></tr>`);
+      return `<div style="margin-bottom:16px">
+        <div class="intel-domain-head">${esc(rec.domain)}</div>
+        <table class="intel-table"><tbody>${rows.join("")}</tbody></table>
+      </div>`;
+    }).join("<hr class='intel-sep'>");
+  }
+
+  // IP Intel
+  const ipDiv = $("ipResults");
+  const ipRecs = intel.ip_intel || [];
+  if (!ipRecs.length) {
+    ipDiv.innerHTML = `<p class="empty-note">No IPs analyzed (no hardcoded IPs detected or network unavailable).</p>`;
+  } else {
+    ipDiv.innerHTML = ipRecs.map(rec => {
+      const rows = [];
+      rows.push(`<tr><td>Type</td><td>${rec.is_private ? 'Private/Internal' : 'Public'}</td></tr>`);
+      if (rec.country)          rows.push(`<tr><td>Country</td><td>${esc(rec.country)}</td></tr>`);
+      if (rec.org)              rows.push(`<tr><td>Organization</td><td>${esc(rec.org)}</td></tr>`);
+      if (rec.asn)              rows.push(`<tr><td>ASN</td><td>${esc(rec.asn)}</td></tr>`);
+      if (rec.hosting_provider) rows.push(`<tr><td>ISP/Hosting</td><td>${esc(rec.hosting_provider)}</td></tr>`);
+      rows.push(`<tr><td>Datacenter</td><td>${rec.is_datacenter ? '<span style="color:var(--orange)">Yes</span>' : 'No'}</td></tr>`);
+      if (rec.reverse_dns)      rows.push(`<tr><td>Reverse DNS</td><td>${esc(rec.reverse_dns)}</td></tr>`);
+      if (rec.risk_flags?.length) rows.push(`<tr><td>Risk Flags</td><td style="color:var(--red)">${esc(rec.risk_flags.join("; "))}</td></tr>`);
+      return `<div style="margin-bottom:16px">
+        <div class="intel-domain-head">${esc(rec.ip)}</div>
+        <table class="intel-table"><tbody>${rows.join("")}</tbody></table>
+      </div>`;
+    }).join("<hr class='intel-sep'>");
+  }
 }
 
 function renderManifest(r) {
@@ -324,6 +421,16 @@ function renderAction(r) {
     <div class="hash-entry"><span class="hash-key">Filename</span><span class="hash-val">${esc(r.filename||"")}</span></div>
     <div class="hash-entry"><span class="hash-key">Timestamp</span><span class="hash-val">${esc(r.analysis_timestamp||"")}</span></div>
     <div class="hash-entry"><span class="hash-key">Scan Time</span><span class="hash-val">${r.analysis_time_ms||0} ms</span></div>`;
+
+  // JSON export
+  $("exportJsonBtn").onclick = () => {
+    if (!currentReport) return;
+    const blob = new Blob([JSON.stringify(currentReport, null, 2)], {type: "application/json"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `frauddroid-report-${(currentReport.filename||"apk").replace(".apk","")}-${Date.now()}.json`;
+    a.click();
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -341,12 +448,20 @@ document.querySelectorAll(".tab").forEach(btn => {
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
+function iocItem(tag, val, note) {
+  return `<div class="ioc-item">
+    <span class="ioc-tag">${esc(tag)}</span>
+    <div><div class="ioc-val">${esc(val)}</div>${note ? `<div class="ioc-note">${esc(note)}</div>` : ""}</div>
+  </div>`;
+}
+
 function esc(s) {
   if (s === null || s === undefined) return "";
   return String(s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
+
 function formatBytes(b) {
   b = Number(b) || 0;
   if (b < 1024) return b + " B";

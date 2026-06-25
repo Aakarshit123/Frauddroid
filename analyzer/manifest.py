@@ -13,9 +13,20 @@ androguard gives us:
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
+import logging
 import zipfile
 import xml.etree.ElementTree as ET
 import re
+
+# Silence androguard loguru spam at module level — applies in both app and test runs
+try:
+    from loguru import logger as _loguru_ref
+    _loguru_ref.remove()
+    import sys as _sys
+    _loguru_ref.add(_sys.stderr, level="CRITICAL")  # CRITICAL only — suppress ERROR too
+except Exception:
+    pass
+logging.getLogger("androguard").setLevel(logging.CRITICAL)
 
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
 
@@ -182,6 +193,8 @@ def _try_androguard(apk_path: str) -> Optional[ManifestAnalysisResult]:
     except ImportError:
         return None
     except Exception as e:
+        import sys
+        print(f"[manifest] androguard parse error ({type(e).__name__}): {e}", file=sys.stderr)
         return None
 
 

@@ -278,3 +278,58 @@ main { max-width: 1100px; margin: auto; padding: 40px 24px 80px; }
   .verdict-banner { flex-direction: column; gap: 20px; }
   .flags-row { flex-direction: column; }
 }
+
+/* ── Intelligence module styles ── */
+.intel-domain-head {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  padding: 6px 0 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+.intel-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.intel-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.intel-table td:first-child {
+  color: var(--txt-muted);
+  font-family: var(--font-mono);
+  width: 110px;
+  white-space: nowrap;
+}
+.intel-table td:last-child {
+  color: var(--txt);
+  word-break: break-all;
+}
+.intel-sep {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 12px 0;
+}
+
+/* ── Malware indicator styles ── */
+.cluster.CRITICAL { border-left-color: var(--red); }
+.cluster.HIGH     { border-left-color: var(--orange); }
+.cluster.MEDIUM   { border-left-color: var(--amber); }
+
+/* ── Export button ── */
+.btn-export {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  color: var(--txt);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 8px 18px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.btn-export:hover { background: var(--accent); color: #000; }

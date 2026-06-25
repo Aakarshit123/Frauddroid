@@ -1,6 +1,6 @@
 """
 Main APK analysis orchestrator.
-Coordinates manifest, permission, and string analysis
+Coordinates manifest, permission, string, and intelligence analysis
 and produces a unified FraudReport.
 """
 
@@ -18,19 +18,19 @@ from typing import List, Optional, Dict
 from analyzer.manifest import analyze_manifest, ManifestAnalysisResult
 from analyzer.permissions import analyze_permissions, PermissionAnalysisResult
 from analyzer.strings import analyze_strings, StringAnalysisResult
+from analyzer.intelligence import run_intelligence, IntelligenceResult
 
 # ---------------------------------------------------------------------------
-# Limits — tuned for 300MB APKs, keeps analysis under ~45s
+# Limits
 # ---------------------------------------------------------------------------
 
-DEX_READ_LIMIT     = 5 * 1024 * 1024   # first 5MB per dex file
-DEX_TOTAL_LIMIT    = 15 * 1024 * 1024  # 15MB total across all dex files
-ASSET_SIZE_LIMIT   = 256 * 1024        # skip assets > 256KB
+DEX_READ_LIMIT     = 5 * 1024 * 1024
+DEX_TOTAL_LIMIT    = 15 * 1024 * 1024
+ASSET_SIZE_LIMIT   = 256 * 1024
 MAX_CHUNK_SIZE     = 65536
 
-# Precompiled patterns — all run at C speed via re engine
-_RE_STRINGS  = re.compile(rb'[ -~]{6,}')     # printable ASCII strings
-_RE_SKIP_EXT = frozenset([                    # binary/media entries to skip entirely
+_RE_STRINGS  = re.compile(rb'[ -~]{6,}')
+_RE_SKIP_EXT = frozenset([
     '.png','.jpg','.jpeg','.gif','.webp','.mp4','.mp3',
     '.ogg','.wav','.ttf','.otf','.woff','.woff2',
     '.so','.db','.sqlite','.keystore','.jks',
@@ -50,6 +50,7 @@ class FraudReport:
     manifest: ManifestAnalysisResult
     permissions: PermissionAnalysisResult
     strings: StringAnalysisResult
+    intelligence: IntelligenceResult
     total_score: float
     verdict: str
     verdict_color: str
@@ -62,7 +63,6 @@ class FraudReport:
 # ---------------------------------------------------------------------------
 
 def _hash_file(path: str):
-    """Compute SHA-256 and MD5 in a single streaming pass."""
     sha = hashlib.sha256()
     md5 = hashlib.md5()
     with open(path, "rb") as f:
@@ -73,18 +73,10 @@ def _hash_file(path: str):
 
 
 def _extract_printable_fast(data: bytes) -> str:
-    """
-    Extract printable ASCII strings using compiled regex (C speed).
-    ~50x faster than the byte-by-byte Python loop for large DEX files.
-    """
     return b"\n".join(_RE_STRINGS.findall(data)).decode("ascii", errors="ignore")
 
 
 def _extract_smali_strings(apk_path: str) -> str:
-    """
-    Pull readable strings from APK entries with size limits to cap analysis time.
-    Priority order: text assets first (richest IOC source), then DEX.
-    """
     chunks = []
     dex_bytes_read = 0
 
@@ -92,11 +84,10 @@ def _extract_smali_strings(apk_path: str) -> str:
         with zipfile.ZipFile(apk_path, "r") as z:
             entries = z.infolist()
 
-            # ---- Pass 1: text/config files ----
+            # Pass 1: text/config files
             for info in entries:
                 name = info.filename.lower()
                 ext  = os.path.splitext(name)[1]
-                # Skip known binary/media formats immediately
                 if ext in _RE_SKIP_EXT:
                     continue
                 if not any(name.endswith(e) for e in
@@ -112,8 +103,7 @@ def _extract_smali_strings(apk_path: str) -> str:
                 except Exception:
                     pass
 
-            # ---- Pass 2: DEX files ----
-            # Sort by filename so classes.dex (most important) is read first
+            # Pass 2: DEX files
             dex_entries = sorted(
                 [e for e in entries if e.filename.lower().endswith(".dex")],
                 key=lambda e: e.filename
@@ -139,13 +129,16 @@ def _compute_verdict(
     perm_result: PermissionAnalysisResult,
     string_result: StringAnalysisResult,
     manifest_result: ManifestAnalysisResult,
-) -> tuple[float, str, str, List[str], str]:
+    intel_result: IntelligenceResult,
+) -> tuple:
 
-    perm_score   = perm_result.normalized_score
-    str_score    = min(100.0, string_result.string_score)
+    perm_score     = perm_result.normalized_score
+    str_score      = min(100.0, string_result.string_score)
     manifest_score = min(100.0, manifest_result.manifest_score * 5)
+    intel_score    = min(100.0, intel_result.intel_score)
 
-    total = (perm_score * 0.55 + str_score * 0.30 + manifest_score * 0.15)
+    # Weighted composite
+    total = (perm_score * 0.50 + str_score * 0.28 + manifest_score * 0.12 + intel_score * 0.10)
     total = round(min(100.0, total), 1)
 
     reasons: List[str] = []
@@ -154,6 +147,11 @@ def _compute_verdict(
         reasons.append(
             f"[{cm.severity}] Matches '{cm.cluster_name}' pattern "
             f"({len(cm.matched_permissions)} permissions matched)"
+        )
+
+    for mi in perm_result.malware_indicators:
+        reasons.append(
+            f"[{mi.severity}] Malware behavior: {mi.name} — {mi.description}"
         )
 
     seen_domains = set()
@@ -167,15 +165,31 @@ def _compute_verdict(
             f"{len(string_result.hardcoded_ips)} hardcoded IP address(es) — possible C2"
         )
 
+    if string_result.crypto_wallets:
+        wallet_types = list({w.wallet_type for w in string_result.crypto_wallets})
+        reasons.append(
+            f"Cryptocurrency wallets found: {', '.join(wallet_types)} — "
+            "possible ransom/fraud payment collection"
+        )
+
     seen_keys = set()
     for k in string_result.api_keys:
         if k.key_type not in seen_keys:
             seen_keys.add(k.key_type)
             reasons.append(f"Hardcoded credential: {k.key_type} — {k.risk_note}")
 
+    # Telegram bot → score boost
     tg_keys = [k for k in string_result.api_keys if "Telegram" in k.key_type]
     if tg_keys:
         total = min(100.0, total + 15)
+
+    # Discord webhook → score boost
+    dc_keys = [k for k in string_result.api_keys if "Discord" in k.key_type]
+    if dc_keys:
+        total = min(100.0, total + 12)
+
+    for w in intel_result.intel_warnings[:5]:
+        reasons.append(f"Threat Intel: {w}")
 
     for w in manifest_result.warnings[:3]:
         reasons.append(f"Manifest: {w}")
@@ -183,27 +197,28 @@ def _compute_verdict(
     for dc in manifest_result.dangerous_components[:2]:
         reasons.append(f"Exposed component: {dc.name} — {dc.danger_reason}")
 
-    has_critical = any(c.severity == "CRITICAL" for c in perm_result.cluster_matches)
+    has_critical = any(c.severity == "CRITICAL" for c in perm_result.cluster_matches) or \
+                   any(m.severity == "CRITICAL" for m in perm_result.malware_indicators)
 
     if has_critical or total >= 65:
         verdict, color = "MALICIOUS", "red"
         action = (
             "Escalate immediately. Collect APK hash for FIR/CFSL submission. "
             "Notify victims not to grant further permissions. "
-            "Trace C2 domains/IPs via CERT-In / ISP coordination."
+            "Trace C2 domains/IPs via CERT-In / ISP coordination (Section 69B IT Act)."
         )
     elif total >= 35:
         verdict, color = "SUSPICIOUS", "orange"
         action = (
             "Requires manual review. Cross-check package name against Play Store. "
             "Trace developer email/phone numbers found. "
-            "Test in isolated device for dynamic behavior."
+            "Test in isolated device for dynamic behavior confirmation."
         )
     else:
         verdict, color = "BENIGN", "green"
         action = (
-            "No strong indicators of fraud. "
-            "Still verify app source and review permissions with complainant."
+            "No strong indicators of fraud detected in static analysis. "
+            "Still verify app source and review permissions with the complainant."
         )
 
     if not reasons:
@@ -224,12 +239,21 @@ def analyze_apk(apk_path: str) -> FraudReport:
     sha, md5 = _hash_file(apk_path)
 
     manifest_result = analyze_manifest(apk_path)
-    perm_result     = analyze_permissions(manifest_result.permissions)
     source_text     = _extract_smali_strings(apk_path)
+    perm_result     = analyze_permissions(manifest_result.permissions, source_text)
     string_result   = analyze_strings(source_text)
 
+    # Collect unique domains and IPs for intelligence lookups
+    all_domains = list({
+        su.domain for su in string_result.suspicious_urls if su.domain
+    })
+    all_ips = list({ip for ip in string_result.hardcoded_ips})
+
+    # Run threat intelligence (DNS/WHOIS/IP — network-dependent, best-effort)
+    intel_result = run_intelligence(all_domains, all_ips, max_domains=8, max_ips=8)
+
     total, verdict, color, reasons, action = _compute_verdict(
-        perm_result, string_result, manifest_result
+        perm_result, string_result, manifest_result, intel_result
     )
 
     return FraudReport(
@@ -241,6 +265,7 @@ def analyze_apk(apk_path: str) -> FraudReport:
         manifest=manifest_result,
         permissions=perm_result,
         strings=string_result,
+        intelligence=intel_result,
         total_score=total,
         verdict=verdict,
         verdict_color=color,
