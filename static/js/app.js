@@ -28,8 +28,15 @@ dropZone.addEventListener("drop", e => {
 });
 $("rescanBtn").addEventListener("click", resetUI);
 
+// On page load always show upload screen, never the report
+window.addEventListener("load", () => {
+  $("reportSection").classList.add("hidden");
+  $("progressSection").classList.add("hidden");
+  $("uploadSection").classList.remove("hidden");
+});
+
 // ---------------------------------------------------------------------------
-// Progress — stays animated until response arrives (no fake timeout)
+// Progress
 // ---------------------------------------------------------------------------
 
 const STEPS = [
@@ -46,22 +53,18 @@ const STEPS = [
 
 let stepTimer = null;
 let stepIdx   = 0;
-let barPct    = 0;
 
 function startProgressAnimation() {
-  stepIdx = 0; barPct = 0;
+  stepIdx = 0;
   $("progressLabel").textContent = STEPS[0];
   $("progressBar").style.width = "5%";
-
   stepTimer = setInterval(() => {
     if (stepIdx < STEPS.length - 1) {
       stepIdx++;
-      // Advance bar but cap at 92% — last push happens on response
-      barPct = Math.min(92, 5 + (stepIdx / (STEPS.length - 1)) * 87);
-      $("progressBar").style.width = barPct + "%";
+      const pct = Math.min(92, 5 + (stepIdx / (STEPS.length - 1)) * 87);
+      $("progressBar").style.width = pct + "%";
       $("progressLabel").textContent = STEPS[stepIdx];
     }
-    // Once at last step, keep label but don't advance bar further
   }, 2800);
 }
 
@@ -91,8 +94,13 @@ async function startAnalysis(file) {
 
     if (data.error) { alert("Analysis error: " + data.error); resetUI(); return; }
 
+    // Validate we got a real report before rendering
+    if (typeof data.total_score === "undefined" || data.total_score === null) {
+      alert("Server returned an incomplete report. Please try again.");
+      resetUI(); return;
+    }
+
     currentReport = data;
-    // Small delay so "Done!" is visible
     setTimeout(() => renderReport(data), 400);
 
   } catch (err) {
@@ -116,6 +124,11 @@ function resetUI() {
 // ---------------------------------------------------------------------------
 
 function renderReport(r) {
+  // Safety guard — never render with missing core fields
+  if (!r || typeof r.total_score !== "number" || !r.verdict || !r.manifest) {
+    alert("Report data is incomplete. Please re-upload the APK.");
+    resetUI(); return;
+  }
   $("progressSection").classList.add("hidden");
   $("reportSection").classList.remove("hidden");
   renderVerdict(r);
@@ -129,21 +142,22 @@ function renderReport(r) {
 
 function renderVerdict(r) {
   const banner = $("verdictBanner");
-  const color  = r.verdict_color;
+  const color  = r.verdict_color || "orange";
   banner.className = "verdict-banner " + color;
   const icons = { red: "☠", orange: "⚠", green: "✓" };
   $("verdictIcon").textContent = icons[color] || "?";
-  $("verdictText").textContent = r.verdict;
+  $("verdictText").textContent = r.verdict || "UNKNOWN";
 
   const circ   = 2 * Math.PI * 32;
-  const offset = circ * (1 - r.total_score / 100);
+  const score  = Number(r.total_score) || 0;
+  const offset = circ * (1 - score / 100);
   const ringColors = { red: "#e63946", orange: "#f4803a", green: "#2ec486" };
   const fg = $("ringFg");
-  fg.style.stroke = ringColors[color];
+  fg.style.stroke = ringColors[color] || "#f4803a";
   setTimeout(() => { fg.style.strokeDashoffset = offset; }, 50);
   const numEl = $("scoreNum");
-  numEl.style.color = ringColors[color];
-  animateCounter(numEl, 0, Math.round(r.total_score), 900);
+  numEl.style.color = ringColors[color] || "#f4803a";
+  animateCounter(numEl, 0, Math.round(score), 900);
 }
 
 function animateCounter(el, from, to, dur) {
@@ -157,15 +171,15 @@ function animateCounter(el, from, to, dur) {
 }
 
 function renderMeta(r) {
-  const m = r.manifest;
+  const m = r.manifest || {};
   const pills = [
     ["Package",      m.package_name    || "Unknown"],
     ["Version",      m.version_name    || "?"],
     ["Version Code", m.version_code    || "?"],
     ["Min SDK",      m.min_sdk         || "?"],
     ["Target SDK",   m.target_sdk      || "?"],
-    ["File Size",    formatBytes(r.file_size_bytes)],
-    ["Scan Time",    r.analysis_time_ms + " ms"],
+    ["File Size",    formatBytes(r.file_size_bytes || 0)],
+    ["Scan Time",    (r.analysis_time_ms || 0) + " ms"],
   ];
   $("metaRow").innerHTML = pills.map(([l, v]) =>
     `<div class="meta-pill">
@@ -177,8 +191,7 @@ function renderMeta(r) {
 
 function renderSummary(r) {
   const ul = $("riskList");
-  // Deduplicate summary lines
-  const unique = [...new Set(r.risk_summary)];
+  const unique = [...new Set(r.risk_summary || [])];
   if (!unique.length) { ul.innerHTML = `<li>No high-confidence risk indicators found.</li>`; return; }
   ul.innerHTML = unique.map(s => {
     const cls = s.includes("[CRITICAL]") ? "critical" : s.includes("[HIGH]") ? "high" : "";
@@ -187,9 +200,9 @@ function renderSummary(r) {
 }
 
 function renderPermissions(r) {
-  const p = r.permissions;
+  const p = r.permissions || { cluster_matches: [], risky_permissions: [] };
   const clusterDiv = $("clusters");
-  if (!p.cluster_matches.length) {
+  if (!p.cluster_matches || !p.cluster_matches.length) {
     clusterDiv.innerHTML = `<p class="empty-note">No fraud permission clusters matched.</p>`;
   } else {
     clusterDiv.innerHTML = p.cluster_matches.map(c => `
@@ -197,20 +210,20 @@ function renderPermissions(r) {
         <div class="cluster-head">
           <span class="cluster-name">${esc(c.cluster_name)}</span>
           <span class="sev-badge ${c.severity}">${c.severity}</span>
-          <span style="font-size:11px;color:var(--txt-muted)">${c.matched_permissions.length} permissions matched</span>
+          <span style="font-size:11px;color:var(--txt-muted)">${(c.matched_permissions||[]).length} permissions matched</span>
         </div>
         <div class="cluster-desc">${esc(c.description)}</div>
         <div class="perm-chips">
-          ${c.matched_permissions.map(p => `<span class="perm-chip">${esc(p.replace("android.permission.",""))}</span>`).join("")}
+          ${(c.matched_permissions||[]).map(pm => `<span class="perm-chip">${esc(pm.replace("android.permission.",""))}</span>`).join("")}
         </div>
       </div>`).join("");
   }
 
   const tbody = $("permTableBody");
-  if (!p.risky_permissions.length) {
+  if (!p.risky_permissions || !p.risky_permissions.length) {
     tbody.innerHTML = `<tr><td colspan="3" class="empty-note">No high-risk permissions found.</td></tr>`; return;
   }
-  tbody.innerHTML = p.risky_permissions
+  tbody.innerHTML = (p.risky_permissions || [])
     .sort((a, b) => b.risk_weight - a.risk_weight)
     .map(pf => {
       const pct   = (pf.risk_weight / 10) * 100;
@@ -225,17 +238,14 @@ function renderPermissions(r) {
 }
 
 function renderStrings(r) {
-  const s = r.strings;
+  const s = r.strings || { suspicious_urls:[], hardcoded_ips:[], api_keys:[], phone_numbers:[], emails:[], urls:[] };
 
-  // Deduplicate suspicious URLs by domain
   const seenDomains = new Set();
-  const dedupedSuspUrls = s.suspicious_urls.filter(u => {
+  const dedupedSuspUrls = (s.suspicious_urls||[]).filter(u => {
     if (seenDomains.has(u.domain)) return false;
     seenDomains.add(u.domain); return true;
   });
-
-  // Deduplicate IPs
-  const dedupedIPs = [...new Set(s.hardcoded_ips)];
+  const dedupedIPs = [...new Set(s.hardcoded_ips||[])];
 
   const sdiv = $("suspDomains");
   let sdHtml = "";
@@ -244,24 +254,22 @@ function renderStrings(r) {
   if (dedupedIPs.length > 20) sdHtml += `<div class="ioc-note" style="padding:6px 10px">...and ${dedupedIPs.length - 20} more IPs</div>`;
   sdiv.innerHTML = sdHtml || `<p class="empty-note">No suspicious domains or IPs found.</p>`;
 
-  // Deduplicate API keys by value
   const seenKeys = new Set();
-  const dedupedKeys = s.api_keys.filter(k => { if (seenKeys.has(k.value)) return false; seenKeys.add(k.value); return true; });
+  const dedupedKeys = (s.api_keys||[]).filter(k => { if (seenKeys.has(k.value)) return false; seenKeys.add(k.value); return true; });
   $("apiKeys").innerHTML = dedupedKeys.length
     ? dedupedKeys.map(k => iocItem(k.key_type.toUpperCase(), k.value, k.risk_note)).join("")
     : `<p class="empty-note">No hardcoded credentials found.</p>`;
 
-  $("phones").innerHTML = s.phone_numbers.length
+  $("phones").innerHTML = (s.phone_numbers||[]).length
     ? [...new Set(s.phone_numbers)].map(p => iocItem("PHONE", p, "")).join("")
     : `<p class="empty-note">No phone numbers found.</p>`;
 
-  $("emails").innerHTML = s.emails.length
+  $("emails").innerHTML = (s.emails||[]).length
     ? [...new Set(s.emails)].map(e => iocItem("EMAIL", e, "")).join("")
     : `<p class="empty-note">No email addresses found.</p>`;
 
-  // Deduplicate all URLs
   const seenUrls = new Set();
-  const dedupedUrls = s.urls.filter(u => { if (seenUrls.has(u.url)) return false; seenUrls.add(u.url); return true; });
+  const dedupedUrls = (s.urls||[]).filter(u => { if (seenUrls.has(u.url)) return false; seenUrls.add(u.url); return true; });
   $("allUrls").innerHTML = dedupedUrls.length
     ? dedupedUrls.map(u =>
         `<div class="ioc-item">
@@ -279,7 +287,7 @@ function iocItem(tag, val, note) {
 }
 
 function renderManifest(r) {
-  const m = r.manifest;
+  const m = r.manifest || {};
   const flags = [
     { label: "Debuggable",        val: m.debuggable,             bad: m.debuggable },
     { label: "Cleartext Traffic", val: m.uses_cleartext_traffic, bad: m.uses_cleartext_traffic },
@@ -291,27 +299,27 @@ function renderManifest(r) {
        <div class="flag-value">${f.val ? "YES" : "NO"}</div>
      </div>`).join("");
 
-  $("dangerousComps").innerHTML = m.dangerous_components.length
-    ? m.dangerous_components.map(c =>
+  $("dangerousComps").innerHTML = (m.dangerous_components||[]).length
+    ? (m.dangerous_components||[]).map(c =>
         `<div class="ioc-item"><span class="ioc-tag">${esc(c.component_type.toUpperCase())}</span>
          <div><div class="ioc-val">${esc(c.name)}</div><div class="ioc-note">${esc(c.danger_reason)}</div></div></div>`
       ).join("")
     : `<p class="empty-note">No dangerously exported components found.</p>`;
 
-  $("manifestWarnings").innerHTML = m.warnings.length
-    ? m.warnings.map(w => `<li>${esc(w)}</li>`).join("")
+  $("manifestWarnings").innerHTML = (m.warnings||[]).length
+    ? (m.warnings||[]).map(w => `<li>${esc(w)}</li>`).join("")
     : `<li>No manifest warnings.</li>`;
 }
 
 function renderAction(r) {
-  $("actionText").textContent = r.recommended_action;
+  $("actionText").textContent = r.recommended_action || "No action guidance available.";
   $("hashRow").innerHTML = `
-    <div class="hash-entry"><span class="hash-key">SHA-256</span><span class="hash-val">${esc(r.sha256)}</span></div>
-    <div class="hash-entry"><span class="hash-key">MD5</span><span class="hash-val">${esc(r.md5)}</span></div>`;
+    <div class="hash-entry"><span class="hash-key">SHA-256</span><span class="hash-val">${esc(r.sha256||"")}</span></div>
+    <div class="hash-entry"><span class="hash-key">MD5</span><span class="hash-val">${esc(r.md5||"")}</span></div>`;
   $("metaHash").innerHTML = `
-    <div class="hash-entry"><span class="hash-key">Filename</span><span class="hash-val">${esc(r.filename)}</span></div>
-    <div class="hash-entry"><span class="hash-key">Timestamp</span><span class="hash-val">${esc(r.analysis_timestamp)}</span></div>
-    <div class="hash-entry"><span class="hash-key">Scan Time</span><span class="hash-val">${r.analysis_time_ms} ms</span></div>`;
+    <div class="hash-entry"><span class="hash-key">Filename</span><span class="hash-val">${esc(r.filename||"")}</span></div>
+    <div class="hash-entry"><span class="hash-key">Timestamp</span><span class="hash-val">${esc(r.analysis_timestamp||"")}</span></div>
+    <div class="hash-entry"><span class="hash-key">Scan Time</span><span class="hash-val">${r.analysis_time_ms||0} ms</span></div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -330,11 +338,13 @@ document.querySelectorAll(".tab").forEach(btn => {
 // Utilities
 // ---------------------------------------------------------------------------
 function esc(s) {
-  return String(s || "")
+  if (s === null || s === undefined) return "";
+  return String(s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 function formatBytes(b) {
+  b = Number(b) || 0;
   if (b < 1024) return b + " B";
   if (b < 1048576) return (b/1024).toFixed(1) + " KB";
   return (b/1048576).toFixed(2) + " MB";
