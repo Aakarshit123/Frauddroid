@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FraudDroid — APK Threat Analyzer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+  <!-- Header -->
+  <header>
+    <div class="header-inner">
+      <div class="logo">
+        <span class="logo-icon">◈</span>
+        <span class="logo-text">FraudDroid</span>
+        <span class="logo-sub">APK Threat Analyzer</span>
+      </div>
+      <div class="header-meta">
+        <span class="badge">UP Police Cyber Cell</span>
+        <span class="badge-mono">v1.0</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Upload Zone -->
+  <main>
+    <section class="upload-section" id="uploadSection">
+      <div class="upload-zone" id="dropZone">
+        <div class="upload-icon">⬡</div>
+        <p class="upload-primary">Drop APK here or <label for="fileInput" class="file-label">browse</label></p>
+        <p class="upload-sub">Accepted: .apk files up to 100 MB · Analysis runs locally on server</p>
+        <input type="file" id="fileInput" accept=".apk" hidden>
+      </div>
+      <div class="upload-hint">
+        <span class="mono">Static analysis only — no network calls made during scan</span>
+      </div>
+    </section>
+
+    <!-- Progress -->
+    <section class="progress-section hidden" id="progressSection">
+      <div class="progress-box">
+        <div class="spinner"></div>
+        <div class="progress-text">
+          <span class="progress-label" id="progressLabel">Extracting APK...</span>
+          <div class="progress-bar-wrap">
+            <div class="progress-bar" id="progressBar"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Report -->
+    <section class="report-section hidden" id="reportSection">
+
+      <!-- Verdict Banner -->
+      <div class="verdict-banner" id="verdictBanner">
+        <div class="verdict-left">
+          <div class="verdict-icon" id="verdictIcon"></div>
+          <div>
+            <div class="verdict-label">VERDICT</div>
+            <div class="verdict-text" id="verdictText"></div>
+          </div>
+        </div>
+        <div class="verdict-right">
+          <div class="score-ring" id="scoreRing">
+            <svg viewBox="0 0 80 80">
+              <circle class="ring-bg" cx="40" cy="40" r="32"/>
+              <circle class="ring-fg" id="ringFg" cx="40" cy="40" r="32"
+                      stroke-dasharray="201" stroke-dashoffset="201"/>
+            </svg>
+            <div class="score-num" id="scoreNum">0</div>
+          </div>
+          <div class="score-label">Risk Score</div>
+        </div>
+      </div>
+
+      <!-- App meta row -->
+      <div class="meta-row" id="metaRow">
+        <!-- filled by JS -->
+      </div>
+
+      <!-- Risk summary -->
+      <div class="card" id="summaryCard">
+        <div class="card-head">⚑ Risk Indicators</div>
+        <ul class="risk-list" id="riskList"></ul>
+      </div>
+
+      <!-- Tabs -->
+      <div class="tabs">
+        <button class="tab active" data-tab="permissions">Permissions</button>
+        <button class="tab" data-tab="strings">Strings & IOCs</button>
+        <button class="tab" data-tab="manifest">Manifest</button>
+        <button class="tab" data-tab="action">Recommended Action</button>
+      </div>
+
+      <!-- Tab: Permissions -->
+      <div class="tab-content active" id="tab-permissions">
+        <div class="card">
+          <div class="card-head">Permission Clusters</div>
+          <div id="clusters"></div>
+        </div>
+        <div class="card">
+          <div class="card-head">All Risky Permissions</div>
+          <table class="data-table" id="permTable">
+            <thead><tr><th>Permission</th><th>Category</th><th>Weight</th></tr></thead>
+            <tbody id="permTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Tab: Strings & IOCs -->
+      <div class="tab-content hidden" id="tab-strings">
+        <div class="two-col">
+          <div class="card">
+            <div class="card-head">⚠ Suspicious Domains &amp; IPs</div>
+            <div id="suspDomains"></div>
+          </div>
+          <div class="card">
+            <div class="card-head">🔑 Hardcoded Credentials</div>
+            <div id="apiKeys"></div>
+          </div>
+        </div>
+        <div class="two-col">
+          <div class="card">
+            <div class="card-head">📞 Phone Numbers</div>
+            <div id="phones"></div>
+          </div>
+          <div class="card">
+            <div class="card-head">✉ Email Addresses</div>
+            <div id="emails"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head">All Extracted URLs</div>
+          <div class="scrollbox" id="allUrls"></div>
+        </div>
+      </div>
+
+      <!-- Tab: Manifest -->
+      <div class="tab-content hidden" id="tab-manifest">
+        <div class="card">
+          <div class="card-head">Application Flags</div>
+          <div class="flags-row" id="flagsRow"></div>
+        </div>
+        <div class="card">
+          <div class="card-head">Dangerous Components</div>
+          <div id="dangerousComps"></div>
+        </div>
+        <div class="card">
+          <div class="card-head">Manifest Warnings</div>
+          <ul class="risk-list" id="manifestWarnings"></ul>
+        </div>
+      </div>
+
+      <!-- Tab: Action -->
+      <div class="tab-content hidden" id="tab-action">
+        <div class="card action-card">
+          <div class="card-head">Investigator Recommended Action</div>
+          <p class="action-text" id="actionText"></p>
+        </div>
+        <div class="card">
+          <div class="card-head">File Hashes (for FIR / CFSL submission)</div>
+          <div class="hash-row" id="hashRow"></div>
+        </div>
+        <div class="card">
+          <div class="card-head">Analysis Metadata</div>
+          <div class="hash-row" id="metaHash"></div>
+        </div>
+      </div>
+
+      <!-- Re-scan -->
+      <div class="rescan-row">
+        <button class="btn-rescan" id="rescanBtn">⟳ Analyze another APK</button>
+      </div>
+
+    </section>
+  </main>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
