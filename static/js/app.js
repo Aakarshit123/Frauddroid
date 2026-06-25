@@ -147,14 +147,14 @@ function renderVerdict(r) {
   const banner = $("verdictBanner");
   const color  = r.verdict_color || "orange";
   banner.className = "verdict-banner " + color;
-  const icons = { red: "☠", orange: "⚠", green: "✓" };
+  const icons = { red: "☠", darkorange: "⚠", orange: "⚠", blue: "ℹ", green: "✓" };
   $("verdictIcon").textContent = icons[color] || "?";
   $("verdictText").textContent = r.verdict || "UNKNOWN";
 
   const circ   = 2 * Math.PI * 32;
   const score  = Number(r.total_score) || 0;
   const offset = circ * (1 - score / 100);
-  const ringColors = { red: "#e63946", orange: "#f4803a", green: "#2ec486" };
+  const ringColors = { red: "#e63946", darkorange: "#e8622a", orange: "#f4803a", blue: "#3a7bd5", green: "#2ec486" };
   const fg = $("ringFg");
   fg.style.stroke = ringColors[color] || "#f4803a";
   setTimeout(() => { fg.style.strokeDashoffset = offset; }, 50);
@@ -234,12 +234,53 @@ function renderPermissions(r) {
         <div class="cluster-head">
           <span class="cluster-name">${esc(mi.name)}</span>
           <span class="sev-badge ${mi.severity}">${mi.severity}</span>
+          ${mi.confidence ? `<span class="sev-badge" style="background:var(--txt-muted);margin-left:4px">Confidence: ${esc(mi.confidence)}</span>` : ""}
         </div>
         <div class="cluster-desc">${esc(mi.description)}</div>
         <div class="perm-chips">
           ${(mi.matched_patterns||[]).map(pat => `<span class="perm-chip">${esc(pat)}</span>`).join("")}
         </div>
       </div>`).join("");
+  }
+
+  // Evidence Correlation Matches
+  const corrDiv = $("correlationMatches");
+  if (corrDiv) {
+    const corrs = p.correlation_matches || [];
+    if (!corrs.length) {
+      corrDiv.innerHTML = `<p class="empty-note">No correlated threat patterns detected.</p>`;
+    } else {
+      corrDiv.innerHTML = corrs.map(c => `
+        <div class="cluster CRITICAL">
+          <div class="cluster-head">
+            <span class="cluster-name">🔗 ${esc(c.pattern_name)}</span>
+            <span class="sev-badge CRITICAL">+${c.bonus_score} pts</span>
+            <span class="sev-badge" style="background:var(--txt-muted);margin-left:4px">Confidence: ${esc(c.confidence)}</span>
+          </div>
+          <div class="cluster-desc">${esc(c.description)}</div>
+        </div>`).join("");
+    }
+  }
+
+  // Detected Frameworks
+  const fwDiv = $("detectedFrameworks");
+  if (fwDiv) {
+    const fws = p.detected_frameworks || [];
+    if (!fws.length) {
+      fwDiv.innerHTML = `<p class="empty-note">No cross-platform frameworks detected.</p>`;
+    } else {
+      fwDiv.innerHTML = fws.map(fw => `
+        <div class="cluster LOW">
+          <div class="cluster-head">
+            <span class="cluster-name">📦 ${esc(fw.name)}</span>
+            <span class="sev-badge" style="background:#3a7bd5">FRAMEWORK</span>
+          </div>
+          <div class="cluster-desc">Generic malware indicators have reduced weight in ${esc(fw.name)} context.</div>
+          <div class="perm-chips">
+            ${(fw.matched_indicators||[]).map(ind => `<span class="perm-chip">${esc(ind)}</span>`).join("")}
+          </div>
+        </div>`).join("");
+    }
   }
 
   // Permission table
@@ -275,7 +316,10 @@ function renderStrings(r) {
 
   let sdHtml = "";
   dedupedSuspUrls.forEach(u => { sdHtml += iocItem("DOMAIN", u.domain, u.reason); });
-  dedupedIPs.slice(0,20).forEach(ip => { sdHtml += iocItem("IPv4", ip, "Hardcoded IP — possible C2/tracker"); });
+  dedupedIPs.slice(0,20).forEach(ip => { sdHtml += iocItem("IPv4", ip, "Hardcoded public IP — possible C2/tracker"); });
+  // Private IPs: informational only, not suspicious
+  const privateIPs = [...new Set(s.private_ips||[])];
+  privateIPs.slice(0,10).forEach(ip => { sdHtml += iocItem("IPv4", ip, "Private/loopback IP — informational only"); });
   dedupedIPv6.slice(0,5).forEach(ip => { sdHtml += iocItem("IPv6", ip, "Hardcoded IPv6 address"); });
   if (dedupedIPs.length > 20) sdHtml += `<div class="ioc-note" style="padding:6px 10px">...and ${dedupedIPs.length-20} more IPs</div>`;
   $("suspDomains").innerHTML = sdHtml || `<p class="empty-note">No suspicious domains or IPs found.</p>`;
@@ -298,12 +342,20 @@ function renderStrings(r) {
   (s.websocket_endpoints||[]).slice(0,10).forEach(u => { cloudHtml += iocItem("WEBSOCKET", u, "WebSocket endpoint — possible real-time C2"); });
   $("cloudAndWs").innerHTML = cloudHtml || `<p class="empty-note">No cloud storage or WebSocket endpoints found.</p>`;
 
-  // Phones & emails
+  // Phones & emails (v2: structured objects with confidence)
   $("phones").innerHTML = (s.phone_numbers||[]).length
-    ? [...new Set(s.phone_numbers)].map(p => iocItem("PHONE", p, "")).join("")
+    ? (s.phone_numbers||[]).map(p => {
+        const num = typeof p === "object" ? p.number : p;
+        const conf = typeof p === "object" ? p.confidence : "HIGH";
+        return iocItem("PHONE", num, conf === "HIGH" ? "" : `Confidence: ${conf}`);
+      }).join("")
     : `<p class="empty-note">No phone numbers found.</p>`;
   $("emails").innerHTML = (s.emails||[]).length
-    ? [...new Set(s.emails)].map(e => iocItem("EMAIL", e, "")).join("")
+    ? (s.emails||[]).map(e => {
+        const addr = typeof e === "object" ? e.address : e;
+        const cat  = typeof e === "object" ? e.category : "";
+        return iocItem("EMAIL", addr, cat);
+      }).join("")
     : `<p class="empty-note">No email addresses found.</p>`;
 
   // All URLs

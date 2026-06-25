@@ -2,6 +2,13 @@
 Main APK analysis orchestrator.
 Coordinates manifest, permission, string, and intelligence analysis
 and produces a unified FraudReport.
+
+v2: Updated for reduced false positives:
+- 5-tier verdict system (BENIGN / LOW RISK / SUSPICIOUS / HIGHLY SUSPICIOUS / LIKELY MALICIOUS)
+- Private IPs not flagged as C2
+- Evidence correlation engine integrated
+- Framework detection context passed through
+- Accessibility manifest declaration passed to permissions analyser
 """
 
 from __future__ import annotations
@@ -13,7 +20,7 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Set
 
 from analyzer.manifest import analyze_manifest, ManifestAnalysisResult
 from analyzer.permissions import analyze_permissions, PermissionAnalysisResult
@@ -125,6 +132,30 @@ def _extract_smali_strings(apk_path: str) -> str:
     return "\n".join(chunks)
 
 
+def _has_accessibility_in_manifest(manifest_result: ManifestAnalysisResult) -> bool:
+    """Check if AccessibilityService is declared in the manifest."""
+    for comp in manifest_result.components:
+        if comp.component_type == "service":
+            if "accessibility" in comp.name.lower():
+                return True
+            for f in comp.intent_filters:
+                if "accessibility" in f.lower():
+                    return True
+    for perm in manifest_result.permissions:
+        if "ACCESSIBILITY" in perm:
+            return True
+    return False
+
+
+VERDICT_COLORS = {
+    "BENIGN": "green",
+    "LOW RISK": "blue",
+    "SUSPICIOUS": "orange",
+    "HIGHLY SUSPICIOUS": "darkorange",
+    "LIKELY MALICIOUS": "red",
+}
+
+
 def _compute_verdict(
     perm_result: PermissionAnalysisResult,
     string_result: StringAnalysisResult,
@@ -151,8 +182,17 @@ def _compute_verdict(
 
     for mi in perm_result.malware_indicators:
         reasons.append(
-            f"[{mi.severity}] Malware behavior: {mi.name} — {mi.description}"
+            f"[{mi.severity}][Confidence: {mi.confidence}] {mi.name} — {mi.description}"
         )
+
+    for corr in perm_result.correlation_matches:
+        reasons.append(
+            f"[CORRELATED][Confidence: {corr.confidence}] {corr.pattern_name}: {corr.description}"
+        )
+
+    if perm_result.detected_frameworks:
+        fw_names = ", ".join(f.name for f in perm_result.detected_frameworks)
+        reasons.append(f"Framework detected: {fw_names} — generic indicators have lower weight")
 
     seen_domains = set()
     for su in string_result.suspicious_urls:
@@ -160,9 +200,16 @@ def _compute_verdict(
             seen_domains.add(su.domain)
             reasons.append(f"Suspicious domain: {su.domain} ({su.reason})")
 
+    # Only flag PUBLIC IPs as possible C2
     if string_result.hardcoded_ips:
         reasons.append(
-            f"{len(string_result.hardcoded_ips)} hardcoded IP address(es) — possible C2"
+            f"{len(string_result.hardcoded_ips)} hardcoded public IP address(es) — possible C2"
+        )
+
+    # Private IPs: informational only
+    if string_result.private_ips:
+        reasons.append(
+            f"{len(string_result.private_ips)} private/loopback IP(s) found — informational only (not C2)"
         )
 
     if string_result.crypto_wallets:
@@ -178,14 +225,13 @@ def _compute_verdict(
             seen_keys.add(k.key_type)
             reasons.append(f"Hardcoded credential: {k.key_type} — {k.risk_note}")
 
-    # Telegram bot → score boost
+    # Telegram/Discord C2 boost (only with other indicators)
     tg_keys = [k for k in string_result.api_keys if "Telegram" in k.key_type]
-    if tg_keys:
+    if tg_keys and (string_result.hardcoded_ips or perm_result.correlation_matches):
         total = min(100.0, total + 15)
 
-    # Discord webhook → score boost
     dc_keys = [k for k in string_result.api_keys if "Discord" in k.key_type]
-    if dc_keys:
+    if dc_keys and (string_result.hardcoded_ips or perm_result.correlation_matches):
         total = min(100.0, total + 12)
 
     for w in intel_result.intel_warnings[:5]:
@@ -197,25 +243,46 @@ def _compute_verdict(
     for dc in manifest_result.dangerous_components[:2]:
         reasons.append(f"Exposed component: {dc.name} — {dc.danger_reason}")
 
-    has_critical = any(c.severity == "CRITICAL" for c in perm_result.cluster_matches) or \
-                   any(m.severity == "CRITICAL" for m in perm_result.malware_indicators)
+    # --- 5-tier Verdict ---
+    # Use permission-level verdict as primary signal, but override with composite score
+    perm_verdict = perm_result.verdict
 
-    if has_critical or total >= 65:
-        verdict, color = "MALICIOUS", "red"
+    # Map to composite score thresholds
+    if total >= 76 or perm_verdict == "LIKELY MALICIOUS":
+        verdict = "LIKELY MALICIOUS"
+        color = VERDICT_COLORS["LIKELY MALICIOUS"]
         action = (
             "Escalate immediately. Collect APK hash for FIR/CFSL submission. "
             "Notify victims not to grant further permissions. "
             "Trace C2 domains/IPs via CERT-In / ISP coordination (Section 69B IT Act)."
         )
-    elif total >= 35:
-        verdict, color = "SUSPICIOUS", "orange"
+    elif total >= 56 or perm_verdict == "HIGHLY SUSPICIOUS":
+        verdict = "HIGHLY SUSPICIOUS"
+        color = VERDICT_COLORS["HIGHLY SUSPICIOUS"]
+        action = (
+            "High likelihood of malicious behavior. Requires urgent manual review. "
+            "Test in isolated device for dynamic behavior confirmation. "
+            "Cross-check with known malware hashes. Consider escalation."
+        )
+    elif total >= 36 or perm_verdict == "SUSPICIOUS":
+        verdict = "SUSPICIOUS"
+        color = VERDICT_COLORS["SUSPICIOUS"]
         action = (
             "Requires manual review. Cross-check package name against Play Store. "
             "Trace developer email/phone numbers found. "
             "Test in isolated device for dynamic behavior confirmation."
         )
+    elif total >= 16 or perm_verdict == "LOW RISK":
+        verdict = "LOW RISK"
+        color = VERDICT_COLORS["LOW RISK"]
+        action = (
+            "Some elevated permissions or indicators detected but no strong malware patterns. "
+            "Verify app source and review permissions with the complainant. "
+            "May be a legitimate app with broad permissions."
+        )
     else:
-        verdict, color = "BENIGN", "green"
+        verdict = "BENIGN"
+        color = VERDICT_COLORS["BENIGN"]
         action = (
             "No strong indicators of fraud detected in static analysis. "
             "Still verify app source and review permissions with the complainant."
@@ -240,14 +307,21 @@ def analyze_apk(apk_path: str) -> FraudReport:
 
     manifest_result = analyze_manifest(apk_path)
     source_text     = _extract_smali_strings(apk_path)
-    perm_result     = analyze_permissions(manifest_result.permissions, source_text)
+
+    # Detect accessibility manifest declaration for context-aware analysis
+    has_accessibility_manifest = _has_accessibility_in_manifest(manifest_result)
+
+    perm_result     = analyze_permissions(
+        manifest_result.permissions, source_text,
+        has_accessibility_manifest=has_accessibility_manifest,
+    )
     string_result   = analyze_strings(source_text)
 
-    # Collect unique domains and IPs for intelligence lookups
+    # Collect unique domains and PUBLIC IPs for intelligence lookups
     all_domains = list({
         su.domain for su in string_result.suspicious_urls if su.domain
     })
-    all_ips = list({ip for ip in string_result.hardcoded_ips})
+    all_ips = list({ip for ip in string_result.hardcoded_ips})  # public IPs only
 
     # Run threat intelligence (DNS/WHOIS/IP — network-dependent, best-effort)
     intel_result = run_intelligence(all_domains, all_ips, max_domains=8, max_ips=8)

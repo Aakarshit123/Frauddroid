@@ -101,17 +101,21 @@ main { max-width: 1100px; margin: auto; padding: 40px 24px 80px; }
   border-radius: var(--radius); padding: 24px 28px;
   margin-bottom: 20px;
 }
-.verdict-banner.red    { border-color: var(--red);    background: var(--red-dim); }
-.verdict-banner.orange { border-color: var(--orange); background: var(--orange-dim); }
-.verdict-banner.green  { border-color: var(--green);  background: var(--green-dim); }
+.verdict-banner.red        { border-color: var(--red);    background: var(--red-dim); }
+.verdict-banner.darkorange { border-color: #e8622a;        background: #3a1a08; }
+.verdict-banner.orange     { border-color: var(--orange); background: var(--orange-dim); }
+.verdict-banner.blue       { border-color: #3a7bd5;        background: #0d1f40; }
+.verdict-banner.green      { border-color: var(--green);  background: var(--green-dim); }
 
 .verdict-left { display: flex; align-items: center; gap: 20px; }
 .verdict-icon { font-size: 44px; }
 .verdict-label { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--txt-muted); margin-bottom: 4px; }
 .verdict-text { font-family: var(--mono); font-size: 28px; font-weight: 700; letter-spacing: .04em; }
-.verdict-banner.red    .verdict-text { color: var(--red); }
-.verdict-banner.orange .verdict-text { color: var(--orange); }
-.verdict-banner.green  .verdict-text { color: var(--green); }
+.verdict-banner.red        .verdict-text { color: var(--red); }
+.verdict-banner.darkorange .verdict-text { color: #e8622a; }
+.verdict-banner.orange     .verdict-text { color: var(--orange); }
+.verdict-banner.blue       .verdict-text { color: #3a7bd5; }
+.verdict-banner.green      .verdict-text { color: var(--green); }
 
 .verdict-right { display: flex; flex-direction: column; align-items: center; gap: 6px; }
 .score-ring { position: relative; width: 80px; height: 80px; }

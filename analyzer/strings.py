@@ -2,12 +2,34 @@
 Static string extraction and threat-indicator analysis.
 Works on decompiled smali/java/kotlin source text.
 No network calls — pure regex-based extraction.
+
+v2: Reduced false positives per spec:
+- Private IPs scored 0 (not flagged as C2)
+- Phone numbers validated for country format / length / exclusion of resource IDs
+- Emails validated for proper domain + TLD structure
+- Crypto wallets require strict format matching
+- Confidence levels on all findings
 """
 
 import re
+import ipaddress
 from dataclasses import dataclass, field
-from typing import List, Set
+from typing import List, Set, Optional
 from urllib.parse import urlparse
+
+# ---------------------------------------------------------------------------
+# Known legitimate / whitelisted TLDs for email validation
+# ---------------------------------------------------------------------------
+
+VALID_TLDS = {
+    "com", "net", "org", "in", "io", "co", "me", "app", "dev", "tech",
+    "gov", "edu", "int", "mil", "uk", "us", "ca", "au", "de", "fr",
+    "jp", "cn", "br", "ru", "it", "es", "nl", "se", "no", "fi", "dk",
+    "pl", "ch", "at", "be", "nz", "sg", "hk", "info", "biz", "name",
+    "pro", "mobi", "tel", "travel", "museum", "coop", "aero", "jobs",
+    "xyz", "top", "club", "live", "online", "site", "store", "shop",
+    "tk", "ml", "ga", "cf", "gq", "pw", "cc",
+}
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -51,7 +73,7 @@ RE_API_KEY = re.compile(
     (?:
         (?P<google_api>AIza[0-9A-Za-z\-_]{35})                              # Google API Key
       | (?P<firebase>AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140})              # Firebase Cloud Messaging
-      | (?P<aws_access>(?:AKIA|AGPA|AROA|ASIA)[0-9A-Z]{16})                 # AWS Access Key (precise prefix)
+      | (?P<aws_access>(?:AKIA|AGPA|AROA|ASIA)[0-9A-Z]{16})                 # AWS Access Key
       | (?P<razorpay>rzp_(?:live|test)_[A-Za-z0-9]{14,})                   # Razorpay
       | (?P<paytm>PAYTM_[A-Z0-9]{16,})                                      # Paytm merchant key
       | (?P<stripe>sk_(?:live|test)_[A-Za-z0-9]{24,})                       # Stripe secret
@@ -64,13 +86,23 @@ RE_API_KEY = re.compile(
     ''',
 )
 
-RE_PHONE = re.compile(r'\b(?:\+91|0)?[6-9]\d{9}\b')
-RE_EMAIL = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Z|a-z]{2,7}\b')
+# Indian phone numbers — stricter: must be 10 digits starting with 6-9
+# Not preceded/followed by digits (avoid resource IDs, hashes)
+RE_PHONE_STRICT = re.compile(r'(?<!\d)(\+91[\-\s]?|0)?([6-9]\d{9})(?!\d)')
 
-# Cryptocurrency addresses
-RE_BTC = re.compile(r'\b(?:1|3)[A-HJ-NP-Za-km-z1-9]{25,34}\b|bc1[a-zA-HJ-NP-Z0-9]{25,39}\b')
+RE_EMAIL = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,7}\b')
+
+# Cryptocurrency addresses — strict patterns
+# BTC: P2PKH (1...), P2SH (3...), or bech32 (bc1...)
+RE_BTC = re.compile(
+    r'\b(?:(?:1[A-HJ-NP-Za-km-z1-9]{25,33})|(?:3[A-HJ-NP-Za-km-z1-9]{25,33})|(?:bc1[a-z0-9]{25,39}))\b'
+)
+
+# ETH: 0x + exactly 40 hex chars
 RE_ETH = re.compile(r'\b0x[a-fA-F0-9]{40}\b')
-RE_USDT_TRON = re.compile(r'\bT[A-Za-z1-9]{33}\b')
+
+# TRON: T + exactly 33 base58 chars (total 34 chars)
+RE_TRON = re.compile(r'\bT[A-Za-z1-9]{33}\b')
 
 # Cloud storage patterns
 RE_CLOUD_STORAGE = re.compile(
@@ -80,7 +112,7 @@ RE_CLOUD_STORAGE = re.compile(
     re.IGNORECASE,
 )
 
-# Known legitimate Android / Google domains to reduce false positives
+# Known legitimate Android / Google domains
 WHITELIST_DOMAINS: Set[str] = {
     "google.com", "googleapis.com", "android.com", "gstatic.com",
     "firebase.com", "firebaseio.com", "crashlytics.com", "fabric.io",
@@ -89,16 +121,44 @@ WHITELIST_DOMAINS: Set[str] = {
     "schema.org", "w3.org", "apache.org", "mozilla.org",
 }
 
-PRIVATE_IP_PREFIXES = ("192.168.", "10.", "172.16.", "172.17.",
-                       "172.18.", "172.19.", "172.20.", "172.21.",
-                       "172.22.", "172.23.", "172.24.", "172.25.",
-                       "172.26.", "172.27.", "172.28.", "172.29.",
-                       "172.30.", "172.31.", "127.", "0.0.0.0")
-
 SUSPICIOUS_TLDS = {".tk", ".ml", ".ga", ".cf", ".top", ".xyz",
                    ".club", ".online", ".site", ".live", ".work"}
 SUSPICIOUS_KEYWORDS = ["panel", "bot", "c2", "cmd", "command",
                        "payload", "agent", "exfil", "upload", "collect"]
+
+# Known developer/SDK email domains to suppress as noise
+SDK_EMAIL_DOMAINS = {
+    "android.com", "google.com", "apache.org", "example.com",
+    "schema.org", "w3.org", "mozilla.org", "ietf.org",
+    "github.com", "stackoverflow.com",
+}
+
+# Known SDK/library email prefixes (false positive indicators)
+SDK_EMAIL_PREFIXES = {
+    "noreply", "no-reply", "support", "info", "contact",
+    "hello", "help", "admin", "webmaster", "postmaster",
+    "donotreply", "do-not-reply",
+}
+
+# ---------------------------------------------------------------------------
+# Private IP detection
+# ---------------------------------------------------------------------------
+
+def _is_private_ip(ip: str) -> bool:
+    """Return True if the IP is private, loopback, or emulator-special."""
+    try:
+        addr = ipaddress.ip_address(ip)
+        return (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_unspecified
+            or addr.is_multicast
+            or ip == "10.0.2.2"  # Android emulator gateway
+        )
+    except ValueError:
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -122,17 +182,31 @@ class ExtractedKey:
 class CryptoWallet:
     wallet_type: str   # BTC / ETH / USDT-TRC20
     address: str
+    confidence: str = "HIGH"  # HIGH / MEDIUM / LOW
+
+@dataclass
+class PhoneNumber:
+    number: str
+    confidence: str  # HIGH / MEDIUM / LOW
+    country: str = "IN"
+
+@dataclass
+class EmailAddress:
+    address: str
+    category: str  # "Application Contact" / "Developer Contact" / "Third-Party Library Contact"
+    confidence: str = "MEDIUM"  # HIGH / MEDIUM / LOW
 
 @dataclass
 class StringAnalysisResult:
     urls: List[ExtractedURL]
     websocket_endpoints: List[str]
     api_endpoints: List[str]
-    hardcoded_ips: List[str]
+    hardcoded_ips: List[str]           # only public IPs
+    private_ips: List[str]             # informational only, not scored
     ipv6_addresses: List[str]
     api_keys: List[ExtractedKey]
-    phone_numbers: List[str]
-    emails: List[str]
+    phone_numbers: List[PhoneNumber]
+    emails: List[EmailAddress]
     crypto_wallets: List[CryptoWallet]
     cloud_storage_urls: List[str]
     suspicious_urls: List[ExtractedURL]
@@ -163,6 +237,110 @@ def _domain_from_url(url: str) -> str:
         return ""
 
 
+def _validate_phone(raw: str) -> Optional[PhoneNumber]:
+    """
+    Validate a candidate phone number match.
+    Returns PhoneNumber with confidence level or None if invalid.
+
+    Rules:
+    - Strip country code (+91 / 0)
+    - Must be exactly 10 digits starting with 6-9
+    - Must not look like a resource ID (e.g. 0x1234567890)
+    - Must not be a hash fragment (all same digit, sequential, etc.)
+    """
+    # Remove common prefix formats
+    digits = re.sub(r'[\s\-\+]', '', raw)
+    digits = re.sub(r'^(?:91|0091|\+91|0)', '', digits)
+    digits = re.sub(r'\D', '', digits)
+
+    if len(digits) != 10:
+        return None
+    if not re.match(r'^[6-9]\d{9}$', digits):
+        return None
+
+    # Reject obvious non-phone patterns
+    # - All same digit: 9999999999
+    if len(set(digits)) == 1:
+        return None
+    # - Sequential: 1234567890, 9876543210
+    if digits in ("1234567890", "9876543210", "0123456789"):
+        return None
+    # - Too many repeating groups (resource ID smell)
+    if re.match(r'^(\d{2,3})\1{2,}', digits):
+        return None
+
+    formatted = f"+91 {digits[:5]} {digits[5:]}"
+    return PhoneNumber(number=formatted, confidence="HIGH", country="IN")
+
+
+def _validate_email(raw: str) -> Optional[EmailAddress]:
+    """
+    Validate and categorize an email address.
+    Returns EmailAddress or None if invalid / noise.
+    """
+    em = raw.lower().strip()
+
+    # Must have exactly one @
+    parts = em.split("@")
+    if len(parts) != 2:
+        return None
+
+    local, domain = parts[0], parts[1]
+
+    # Domain must have at least one dot and a valid TLD
+    domain_parts = domain.split(".")
+    if len(domain_parts) < 2:
+        return None
+
+    tld = domain_parts[-1]
+    if tld not in VALID_TLDS:
+        return None
+
+    # Domain must be at least 4 chars total
+    if len(domain) < 4:
+        return None
+
+    # Suppress SDK / library noise domains
+    base_domain = ".".join(domain_parts[-2:])
+    if base_domain in SDK_EMAIL_DOMAINS or domain in SDK_EMAIL_DOMAINS:
+        return None
+
+    # Categorize
+    if base_domain in SDK_EMAIL_DOMAINS or any(sdk in domain for sdk in SDK_EMAIL_DOMAINS):
+        category = "Third-Party Library Contact"
+    elif local in SDK_EMAIL_PREFIXES:
+        category = "Application Contact"
+    else:
+        category = "Developer Contact"
+
+    # Confidence: high if domain looks real, medium otherwise
+    confidence = "HIGH" if len(domain_parts[-2]) >= 3 else "MEDIUM"
+
+    return EmailAddress(address=em, category=category, confidence=confidence)
+
+
+def _validate_btc(addr: str) -> bool:
+    """Strict BTC address validation."""
+    if addr.startswith("bc1"):
+        # bech32: bc1 + 25-39 lowercase alphanumeric
+        return bool(re.match(r'^bc1[a-z0-9]{25,39}$', addr))
+    elif addr.startswith("1") or addr.startswith("3"):
+        # Base58: 26-34 chars, no 0/O/I/l
+        return bool(re.match(r'^[13][A-HJ-NP-Za-km-z1-9]{25,33}$', addr)) and \
+               len(addr) >= 26 and len(addr) <= 34
+    return False
+
+
+def _validate_eth(addr: str) -> bool:
+    """Strict ETH address: 0x + exactly 40 hex chars."""
+    return bool(re.match(r'^0x[a-fA-F0-9]{40}$', addr))
+
+
+def _validate_tron(addr: str) -> bool:
+    """Strict TRON address: T + exactly 33 base58 chars = 34 total."""
+    return bool(re.match(r'^T[A-Za-z1-9]{33}$', addr)) and len(addr) == 34
+
+
 # ---------------------------------------------------------------------------
 # Main function
 # ---------------------------------------------------------------------------
@@ -181,11 +359,12 @@ def analyze_strings(source_text: str) -> StringAnalysisResult:
     seen_cloud: Set[str] = set()
 
     urls: List[ExtractedURL] = []
-    hardcoded_ips: List[str] = []
+    hardcoded_ips: List[str] = []    # public IPs only
+    private_ips: List[str] = []       # informational only
     ipv6_addresses: List[str] = []
     api_keys: List[ExtractedKey] = []
-    phone_numbers: List[str] = []
-    emails: List[str] = []
+    phone_numbers: List[PhoneNumber] = []
+    emails: List[EmailAddress] = []
     suspicious_urls: List[ExtractedURL] = []
     websocket_endpoints: List[str] = []
     api_endpoints: List[str] = []
@@ -243,15 +422,18 @@ def analyze_strings(source_text: str) -> StringAnalysisResult:
             api_endpoints.append(ep)
 
     # --- IPv4 ---
+    # Private IPs (10.x, 192.168.x, 172.16-31.x, 127.x, 10.0.2.2) → informational, score=0
+    # Public IPs → scored
     for match in RE_IP.finditer(source_text):
         ip = match.group()
         if ip in seen_ips or ip in ("0.0.0.0", "255.255.255.255", "127.0.0.1"):
             continue
         seen_ips.add(ip)
-        hardcoded_ips.append(ip)
-        if any(ip.startswith(p) for p in PRIVATE_IP_PREFIXES):
-            score += 5
+        if _is_private_ip(ip):
+            private_ips.append(ip)
+            # score += 0  # Private IPs are NOT suspicious
         else:
+            hardcoded_ips.append(ip)
             score += 12
 
     # --- IPv6 ---
@@ -298,45 +480,54 @@ def analyze_strings(source_text: str) -> StringAnalysisResult:
                 risk_note=note,
             ))
 
-    # --- Phone numbers ---
-    for match in RE_PHONE.finditer(source_text):
-        ph = match.group()
-        if ph not in seen_phones:
-            seen_phones.add(ph)
-            phone_numbers.append(ph)
+    # --- Phone numbers (HIGH confidence only) ---
+    for match in RE_PHONE_STRICT.finditer(source_text):
+        raw = match.group()
+        if raw in seen_phones:
+            continue
+        seen_phones.add(raw)
+        phone = _validate_phone(raw)
+        if phone and phone.confidence == "HIGH":
+            phone_numbers.append(phone)
             score += 5
 
-    # --- Emails ---
+    # --- Emails (validated, no SDK noise) ---
     for match in RE_EMAIL.finditer(source_text):
         em = match.group().lower()
         if em in seen_emails:
             continue
         seen_emails.add(em)
-        if any(wl in em for wl in ("apache.org", "example.com", "schema.org")):
-            continue
-        emails.append(em)
-        score += 3
+        email_obj = _validate_email(em)
+        if email_obj:
+            emails.append(email_obj)
+            score += 3
 
-    # --- Crypto wallets ---
+    # --- Crypto wallets (strict validation) ---
     for match in RE_BTC.finditer(source_text):
         addr = match.group()
-        if addr not in seen_crypto and len(addr) >= 26:
+        if addr in seen_crypto:
+            continue
+        if _validate_btc(addr):
             seen_crypto.add(addr)
-            crypto_wallets.append(CryptoWallet("BTC", addr))
+            crypto_wallets.append(CryptoWallet("BTC", addr, confidence="HIGH"))
             score += 20
 
     for match in RE_ETH.finditer(source_text):
         addr = match.group()
-        if addr not in seen_crypto:
+        if addr in seen_crypto:
+            continue
+        if _validate_eth(addr):
             seen_crypto.add(addr)
-            crypto_wallets.append(CryptoWallet("ETH", addr))
+            crypto_wallets.append(CryptoWallet("ETH", addr, confidence="HIGH"))
             score += 20
 
-    for match in RE_USDT_TRON.finditer(source_text):
+    for match in RE_TRON.finditer(source_text):
         addr = match.group()
-        if addr not in seen_crypto:
+        if addr in seen_crypto:
+            continue
+        if _validate_tron(addr):
             seen_crypto.add(addr)
-            crypto_wallets.append(CryptoWallet("USDT-TRC20", addr))
+            crypto_wallets.append(CryptoWallet("USDT-TRC20", addr, confidence="HIGH"))
             score += 20
 
     # --- Cloud storage ---
@@ -352,6 +543,7 @@ def analyze_strings(source_text: str) -> StringAnalysisResult:
         websocket_endpoints=websocket_endpoints,
         api_endpoints=api_endpoints,
         hardcoded_ips=hardcoded_ips,
+        private_ips=private_ips,
         ipv6_addresses=ipv6_addresses,
         api_keys=api_keys,
         phone_numbers=phone_numbers,
