@@ -23,10 +23,10 @@ from analyzer.strings import analyze_strings, StringAnalysisResult
 # Limits — tuned for 300MB APKs, keeps analysis under ~45s
 # ---------------------------------------------------------------------------
 
-DEX_READ_LIMIT     = 12 * 1024 * 1024  # read first 12MB of each .dex file
-DEX_TOTAL_LIMIT    = 40 * 1024 * 1024  # stop after 40MB total DEX content
-ASSET_SIZE_LIMIT   = 1 * 1024 * 1024   # skip asset files > 1MB
-MAX_CHUNK_SIZE     = 65536             # streaming chunk size for hashing
+DEX_READ_LIMIT     = 5 * 1024 * 1024   # first 5MB per dex file
+DEX_TOTAL_LIMIT    = 15 * 1024 * 1024  # 15MB total across all dex files
+ASSET_SIZE_LIMIT   = 256 * 1024        # skip assets > 256KB
+MAX_CHUNK_SIZE     = 65536
 
 # Precompiled patterns — all run at C speed via re engine
 _RE_STRINGS  = re.compile(rb'[ -~]{6,}')     # printable ASCII strings

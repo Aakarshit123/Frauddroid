@@ -92,10 +92,25 @@ def analyze():
     f.save(save_path)
 
     try:
-        report = analyze_apk(save_path)
-        return jsonify(to_dict(report))
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import signal
+
+        def _timeout_handler(signum, frame):
+            raise TimeoutError("Analysis timed out — APK may be too large for this server")
+
+        # 90 second hard limit per analysis
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(90)
+
+        try:
+            report = analyze_apk(save_path)
+            signal.alarm(0)  # cancel alarm
+            return jsonify(to_dict(report))
+        except TimeoutError as te:
+            signal.alarm(0)
+            return jsonify({"error": str(te)}), 504
+        except Exception as e:
+            signal.alarm(0)
+            return jsonify({"error": str(e)}), 500
     finally:
         try:
             os.remove(save_path)

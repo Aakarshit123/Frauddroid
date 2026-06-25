@@ -92,6 +92,10 @@ async function startAnalysis(file) {
     const data = await res.json();
     finishProgress();
 
+    if (res.status === 504 || (data.error && data.error.includes("timed out"))) {
+      alert("This APK is too large to analyze fully on the free server (184MB+ APKs need more RAM).\n\nTip: Run FraudDroid locally on your machine for large APKs — it handles 300MB easily.");
+      resetUI(); return;
+    }
     if (data.error) { alert("Analysis error: " + data.error); resetUI(); return; }
 
     // Validate we got a real report before rendering
