@@ -20,6 +20,26 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Set, Optional
 
 # ---------------------------------------------------------------------------
+# Known-safe package prefixes — Google/AOSP/major vendors
+# ---------------------------------------------------------------------------
+
+KNOWN_SAFE_PACKAGES = frozenset({
+    "com.google.", "com.android.", "com.samsung.", "com.oneplus.",
+    "com.huawei.", "com.xiaomi.", "com.oppo.", "com.vivo.", "com.motorola.",
+    "android.", "androidx.", "com.microsoft.", "com.facebook.", "com.instagram.",
+    "com.whatsapp.", "com.twitter.", "com.linkedin.", "com.snapchat.",
+})
+
+
+def _is_known_safe_package(package_name: str) -> bool:
+    """Return True if this package is from a known-legitimate vendor namespace."""
+    if not package_name:
+        return False
+    pkg_lower = package_name.lower()
+    return any(pkg_lower.startswith(p) for p in KNOWN_SAFE_PACKAGES)
+
+
+# ---------------------------------------------------------------------------
 # Risk-weighted permission catalogue
 # ---------------------------------------------------------------------------
 
@@ -212,9 +232,15 @@ MALWARE_PATTERNS: List[Dict] = [
     },
 
     # Root / Shell Execution
+    # ProcessBuilder / Runtime.exec alone are NOT sufficient — used by Google Authenticator,
+    # banking apps, security tools. We require explicit shell/su command strings.
     {
         "name": "Root / Shell Execution",
-        "patterns": ["su\x00", "/system/xbin/su", "Runtime.getRuntime().exec", "ProcessBuilder"],
+        "patterns": [
+            "su\x00", "/system/xbin/su", "/sbin/su", "/system/bin/su",
+            "\"su -c\"", "su -c ", "/system/xbin/busybox",
+            "Runtime.getRuntime().exec(\"su", "ProcessBuilder(\"su",
+        ],
         "description": "Attempts to execute shell commands or escalate to root",
         "severity": "CRITICAL",
         "score": 25,
@@ -493,18 +519,26 @@ def _analyze_accessibility_abuse(source_text: str, permissions: Set[str],
         matched += [p for p in mp["impl_patterns"] if p in source_text]
 
     has_theft = any(p in source_text for p in mp["theft_patterns"])
-    if has_theft:
+    if has_theft and has_impl:
+        # Both active implementation AND credential theft patterns = confirmed abuse
         score += 40
         confidence = "HIGH"
         matched += [p for p in mp["theft_patterns"] if p in source_text]
+    elif has_theft and not has_impl:
+        # Theft patterns without active impl — could be security audit code (e.g. Google Authenticator)
+        # Only add minor score, keep MEDIUM severity
+        score += 5
+        confidence = "LOW"
 
     if score == 0:
         return None  # String-only, no manifest — don't report
 
+    # Require score >= 20 (manifest + impl) to be CRITICAL
+    effective_severity = mp["severity"] if score >= 30 else ("HIGH" if score >= 15 else "MEDIUM")
     return MalwareIndicator(
         name="Accessibility Service Abuse",
         description=mp["description"],
-        severity=mp["severity"] if score >= 20 else "MEDIUM",
+        severity=effective_severity,
         matched_patterns=matched[:3],
         score_contribution=score,
         confidence=confidence,
@@ -653,12 +687,16 @@ def _run_correlation_engine(
 # ---------------------------------------------------------------------------
 
 def analyze_permissions(permissions: List[str], source_text: str = "",
-                         has_accessibility_manifest: bool = False) -> PermissionAnalysisResult:
+                         has_accessibility_manifest: bool = False,
+                         package_name: str = "") -> PermissionAnalysisResult:
     permissions_set = set(permissions)
 
     # --- Framework detection ---
     detected_frameworks = _detect_frameworks(source_text) if source_text else []
     framework_names = {f.name for f in detected_frameworks}
+
+    # --- Known-safe package check ---
+    is_known_safe = _is_known_safe_package(package_name)
 
     # --- Score risky permissions ---
     risky: List[PermissionFinding] = []
@@ -685,7 +723,14 @@ def analyze_permissions(permissions: List[str], source_text: str = "",
                 matched_permissions=matched,
                 match_ratio=len(matched) / len(cluster["permissions"]),
             ))
+            # Base bonus per matched permission
             raw_score += 20 * len(matched)
+            # Full-cluster bonus for CRITICAL clusters: extra weight when ALL threshold
+            # permissions are present (e.g. all 3 SMS interception perms = confirmed pattern)
+            if cluster["severity"] == "CRITICAL" and len(matched) >= len(cluster["permissions"]):
+                raw_score += 30  # full critical cluster = guaranteed HIGHLY SUSPICIOUS+
+            elif cluster["severity"] == "CRITICAL" and len(matched) >= cluster["threshold"]:
+                raw_score += 15
 
     # --- Malware behavior indicators (from DEX strings) ---
     malware_indicators: List[MalwareIndicator] = []
@@ -765,6 +810,17 @@ def analyze_permissions(permissions: List[str], source_text: str = "",
     # --- Normalize to 0-100 ---
     max_possible = 200
     normalized = min(100.0, (raw_score / max_possible) * 100)
+
+    # --- Known-safe package dampening ---
+    # Google/AOSP packages like Authenticator legitimately use Accessibility APIs
+    # for security auditing, ProcessBuilder for process management, etc.
+    # Cap their score and require stronger corroborating evidence.
+    if is_known_safe:
+        normalized = min(normalized, 45.0)  # can at most be SUSPICIOUS, not HIGHLY SUSPICIOUS
+        # Downgrade solo CRITICAL malware indicators to HIGH for known-safe packages
+        for mi in malware_indicators:
+            if mi.severity == "CRITICAL" and mi.score_contribution < 30:
+                mi.severity = "HIGH"
 
     # --- 5-tier Verdict System ---
     # 0-15: BENIGN

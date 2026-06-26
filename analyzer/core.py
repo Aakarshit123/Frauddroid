@@ -314,6 +314,7 @@ def analyze_apk(apk_path: str) -> FraudReport:
     perm_result     = analyze_permissions(
         manifest_result.permissions, source_text,
         has_accessibility_manifest=has_accessibility_manifest,
+        package_name=manifest_result.package_name or "",
     )
     string_result   = analyze_strings(source_text)
 

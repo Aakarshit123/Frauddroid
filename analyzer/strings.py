@@ -41,9 +41,12 @@ RE_IP = re.compile(
 )
 
 RE_IPV6 = re.compile(
+    # Full 8-group IPv6 (no compression) — most reliable
     r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b'
-    r'|\b(?:[0-9a-fA-F]{1,4}:){1,7}:\b'
-    r'|\b::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}\b'
+    # Compressed forms — require at least one full hex group on both sides to avoid
+    # matching things like ::9, ::1 (loopback), :: in CSS, etc.
+    r'|\b(?:[0-9a-fA-F]{1,4}:){2,7}:\b'
+    r'|\b::(?:[0-9a-fA-F]{1,4}:){1,6}[0-9a-fA-F]{1,4}\b'
 )
 
 RE_DOMAIN = re.compile(
@@ -102,7 +105,18 @@ RE_BTC = re.compile(
 RE_ETH = re.compile(r'\b0x[a-fA-F0-9]{40}\b')
 
 # TRON: T + exactly 33 base58 chars (total 34 chars)
-RE_TRON = re.compile(r'\bT[A-Za-z1-9]{33}\b')
+# Requires at least 2 digits in the body to distinguish from Java class names
+# like "ThirdPartyDeviceManagementRequired" (pure-alpha, ~34 chars).
+# Real TRON addresses are pseudo-random and always contain multiple digits.
+RE_TRON = re.compile(
+    r'\bT'
+    r'(?=[A-Za-z1-9]{33}\b)'            # 33 more chars then word boundary
+    r'(?=[A-Za-z1-9]{0,32}\d.*\b)'     # at least 1 digit in body
+    r'(?=[A-Za-z1-9]{0,25}\d.*\d.*\b)' # at least 2 digits in body
+    r'[A-HJ-NP-Za-km-z1-9]{33}'         # base58 body (no 0/O/I/l)
+    r'\b'
+)
+
 
 # Cloud storage patterns
 RE_CLOUD_STORAGE = re.compile(
